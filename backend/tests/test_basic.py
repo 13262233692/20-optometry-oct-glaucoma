@@ -164,5 +164,182 @@ def test_health_status_enum():
     assert HealthStatus.UNKNOWN.value == "unknown"
 
 
+def test_physical_resampler_import():
+    from app.processing.resampler import (
+        PhysicalSpaceResampler,
+        ResampleTransform,
+        ResampleResult,
+        get_physical_resampler
+    )
+    assert PhysicalSpaceResampler is not None
+    assert ResampleTransform is not None
+    assert ResampleResult is not None
+    assert get_physical_resampler is not None
+
+
+def test_physical_resampler_basic():
+    from app.processing.resampler import PhysicalSpaceResampler
+
+    volume = np.random.rand(200, 200, 128).astype(np.float32)
+    original_spacing = (0.005, 0.005, 0.0035)
+    target_shape = (128, 128, 64)
+
+    resampler = PhysicalSpaceResampler(
+        target_shape=target_shape,
+        target_spacing=(0.005, 0.005, 0.0035),
+        enable_pre_crop=True
+    )
+
+    result = resampler.resample(volume, original_spacing, is_mask=False)
+    assert result.volume.shape == target_shape
+    assert result.transform is not None
+    assert result.transform.original_shape == volume.shape
+    assert result.transform.final_shape == target_shape
+
+
+def test_physical_resampler_different_spacing():
+    from app.processing.resampler import PhysicalSpaceResampler
+
+    volume = np.random.rand(150, 150, 256).astype(np.float32)
+    original_spacing = (0.006, 0.006, 0.002)
+    target_shape = (128, 128, 64)
+    target_spacing = (0.005, 0.005, 0.0035)
+
+    resampler = PhysicalSpaceResampler(
+        target_shape=target_shape,
+        target_spacing=target_spacing,
+        enable_pre_crop=False
+    )
+
+    result = resampler.resample(volume, original_spacing, is_mask=False)
+    assert result.volume.shape == target_shape
+    assert len(result.transform.resample_scale_factors) == 3
+
+
+def test_physical_resampler_roundtrip_inverse():
+    from app.processing.resampler import PhysicalSpaceResampler
+
+    volume = np.random.rand(180, 180, 128).astype(np.float32)
+    original_spacing = (0.0048, 0.0048, 0.0036)
+    target_shape = (128, 128, 64)
+    target_spacing = (0.005, 0.005, 0.0035)
+
+    resampler = PhysicalSpaceResampler(
+        target_shape=target_shape,
+        target_spacing=target_spacing,
+        enable_pre_crop=False
+    )
+
+    result = resampler.resample(volume, original_spacing, is_mask=False)
+    assert result.volume.shape == target_shape
+
+    restored = resampler.inverse_transform(
+        result.volume,
+        result.transform,
+        is_mask=False
+    )
+    assert restored.shape == volume.shape
+
+
+def test_physical_resampler_mask_roundtrip():
+    from app.processing.resampler import PhysicalSpaceResampler
+
+    mask = np.zeros((200, 200, 128), dtype=np.uint8)
+    mask[50:150, 50:150, 40:80] = 1
+    original_spacing = (0.005, 0.005, 0.0035)
+    target_shape = (128, 128, 64)
+    target_spacing = (0.005, 0.005, 0.0035)
+
+    resampler = PhysicalSpaceResampler(
+        target_shape=target_shape,
+        target_spacing=target_spacing,
+        enable_pre_crop=False
+    )
+
+    result = resampler.resample(mask, original_spacing, is_mask=True)
+    assert result.volume.shape == target_shape
+    assert np.issubdtype(result.volume.dtype, np.unsignedinteger)
+
+    restored = resampler.inverse_transform(
+        result.volume,
+        result.transform,
+        is_mask=True
+    )
+    assert restored.shape == mask.shape
+    assert np.issubdtype(restored.dtype, np.unsignedinteger)
+
+
+def test_oct_preprocessor_with_physical_resampling():
+    from app.processing.preprocessing import OCTPreprocessor
+    from app.processing.image_loader import VolumeInfo
+
+    volume = np.random.rand(200, 200, 128).astype(np.float32) * 100 + 50
+    original_spacing = (0.005, 0.005, 0.0035)
+    target_shape = (128, 128, 64)
+
+    volume_info = VolumeInfo(
+        shape=volume.shape,
+        voxel_spacing=original_spacing,
+        file_format="nifti"
+    )
+
+    preprocessor = OCTPreprocessor(
+        target_shape=target_shape,
+        use_physical_resampling=True,
+        enable_pre_crop=True,
+        apply_bias_correction=False
+    )
+
+    result = preprocessor.preprocess(volume, volume_info)
+    assert result.volume.shape == target_shape
+    assert result.original_voxel_spacing == original_spacing
+    assert result.resampled_voxel_spacing == preprocessor.target_spacing
+    assert result.resample_transform is not None
+    assert hasattr(result, 'normalization_params')
+
+
+def test_restore_mask_to_original_space():
+    from app.processing.preprocessing import OCTPreprocessor
+    from app.processing.image_loader import VolumeInfo
+
+    volume = np.random.rand(180, 180, 128).astype(np.float32) * 100 + 50
+    original_shape = volume.shape
+    original_spacing = (0.006, 0.006, 0.0025)
+    target_shape = (128, 128, 64)
+
+    volume_info = VolumeInfo(
+        shape=original_shape,
+        voxel_spacing=original_spacing,
+        file_format="nifti"
+    )
+
+    preprocessor = OCTPreprocessor(
+        target_shape=target_shape,
+        target_spacing=(0.005, 0.005, 0.0035),
+        use_physical_resampling=True,
+        enable_pre_crop=False,
+        apply_bias_correction=False
+    )
+
+    preprocessed = preprocessor.preprocess(volume, volume_info)
+
+    fake_mask_network = np.random.rand(*target_shape).astype(np.float32)
+    fake_mask_network[40:80, 40:80, 20:40] = 0.9
+
+    restored_mask = preprocessor.restore_mask_to_original_space(
+        fake_mask_network,
+        preprocessed,
+        is_probability_map=False
+    )
+    assert restored_mask.shape == original_shape
+
+    restored_prob = preprocessor.restore_mask_to_original_space(
+        fake_mask_network,
+        preprocessed,
+        is_probability_map=True
+    )
+    assert restored_prob.shape == original_shape
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

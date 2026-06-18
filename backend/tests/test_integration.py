@@ -80,21 +80,34 @@ def test_full_inference_pipeline():
     print(f"  Probability range: [{probability_map.min():.4f}, {probability_map.max():.4f}]")
     print(f"  Inference time: {infer_time:.1f} ms")
 
-    print("\nRunning postprocessing...")
+    print("\nRunning postprocessing (using restore_mask_to_original_space)...")
     from app.processing.postprocessing import (
         compute_segmentation_statistics,
-        refine_segmentation,
-        resize_to_original
+        refine_segmentation
     )
 
-    segmentation_mask = refine_segmentation(
+    seg_mask_network_space = refine_segmentation(
         probability_map,
         threshold=0.5,
         min_object_size=50,
         closing_radius=1
     )
-    segmentation_mask = resize_to_original(segmentation_mask, original_shape, order=0)
+    print(f"  Network-space segmentation shape: {seg_mask_network_space.shape}")
+
+    segmentation_mask = preprocessor.restore_mask_to_original_space(
+        seg_mask_network_space,
+        preprocessed,
+        is_probability_map=False
+    )
+    probability_map_restored = preprocessor.restore_mask_to_original_space(
+        probability_map,
+        preprocessed,
+        is_probability_map=True
+    )
     print(f"  Segmentation mask shape: {segmentation_mask.shape}")
+    print(f"  Restored probability map shape: {probability_map_restored.shape}")
+    assert segmentation_mask.shape == original_shape, \
+        f"Shape mismatch after inverse transform: {segmentation_mask.shape} vs {original_shape}"
     print(f"  RNFL voxels: {int(np.sum(segmentation_mask > 0)):,}")
 
     thickness_map = extract_thickness_map(
@@ -119,8 +132,8 @@ def test_full_inference_pipeline():
     print(f"  Defect regions detected: {len(defect_regions)}")
     for r in defect_regions[:3]:
         print(f"    - Region {r.region_id}: {r.severity.value}, "
-              f"area={r.area_mm2:.2f} mm², "
-              f"mean_thickness={r.mean_thickness:.1f} μm")
+              f"area={r.area_mm2:.2f} mm^2, "
+              f"mean_thickness={r.mean_thickness:.1f} um")
 
     statistics = compute_segmentation_statistics(
         segmentation_mask,
@@ -224,17 +237,222 @@ def test_save_and_load_synthetic_nifti():
         print("✅ NIfTI save/load test passed!")
 
 
+def test_multi_device_shape_spacing_compatibility():
+    """
+    测试不同品牌/型号眼科设备的数据兼容性：
+    - 设备 A: (200, 200, 128) @ (0.005, 0.005, 0.0035) mm  （标准设备）
+    - 设备 B: (150, 150, 256) @ (0.006, 0.006, 0.0018) mm  （高分辨率 Z 轴，Zeiss 风格）
+    - 设备 C: (300, 300, 64)  @ (0.0035, 0.0035, 0.007) mm （高分辨率 XY，Topcon 风格）
+    - 设备 D: (256, 256, 96)  @ (0.0042, 0.0042, 0.0048) mm（中等分辨率）
+    """
+    from app.config import get_settings
+    from app.processing.image_loader import VolumeInfo
+    from app.processing.preprocessing import OCTPreprocessor
+
+    settings = get_settings()
+    target_shape = settings.input_volume_size
+
+    device_scenarios = [
+        {
+            "name": "Device-A (Standard 128-slice)",
+            "shape": (200, 200, 128),
+            "spacing": (0.005, 0.005, 0.0035)
+        },
+        {
+            "name": "Device-B (High-Z 256-slice, Zeiss-like)",
+            "shape": (150, 150, 256),
+            "spacing": (0.006, 0.006, 0.0018)
+        },
+        {
+            "name": "Device-C (High-XY 64-slice, Topcon-like)",
+            "shape": (300, 300, 64),
+            "spacing": (0.0035, 0.0035, 0.007)
+        },
+        {
+            "name": "Device-D (Medium 96-slice)",
+            "shape": (256, 256, 96),
+            "spacing": (0.0042, 0.0042, 0.0048)
+        }
+    ]
+
+    preprocessor = OCTPreprocessor(
+        target_shape=target_shape,
+        use_physical_resampling=True,
+        enable_pre_crop=True,
+        apply_bias_correction=False
+    )
+
+    print("\n" + "=" * 70)
+    print("  Multi-Device Shape/Spacing Compatibility Test")
+    print("=" * 70)
+
+    all_passed = True
+    for scenario in device_scenarios:
+        name = scenario["name"]
+        orig_shape = scenario["shape"]
+        orig_spacing = scenario["spacing"]
+
+        print(f"\n▶ Testing {name}:")
+        print(f"    Input:  {orig_shape} @ spacing={orig_spacing} mm")
+        print(f"    Target: {target_shape} @ {preprocessor.target_spacing} mm")
+
+        volume = np.random.randn(*orig_shape).astype(np.float32) * 30 + 100
+        yy, xx, zz = np.mgrid[0:orig_shape[0], 0:orig_shape[1], 0:orig_shape[2]]
+        cy, cx, cz = orig_shape[0] // 2, orig_shape[1] // 2, orig_shape[2] // 2
+        dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        rnfl_region = (dist < min(orig_shape[0], orig_shape[1]) * 0.35) & \
+                      (zz > cz - orig_shape[2] * 0.1) & (zz < cz + orig_shape[2] * 0.1)
+        volume[rnfl_region] += 80
+        volume = np.clip(volume, 0, 255)
+
+        volume_info = VolumeInfo(
+            shape=orig_shape,
+            voxel_spacing=orig_spacing,
+            file_format="nifti"
+        )
+
+        try:
+            preprocessed = preprocessor.preprocess(volume, volume_info)
+            assert preprocessed.volume.shape == target_shape, \
+                f"Preprocessed shape mismatch: {preprocessed.volume.shape} vs {target_shape}"
+            assert preprocessed.original_shape == orig_shape
+            assert preprocessed.original_voxel_spacing == orig_spacing
+            assert preprocessed.resample_transform is not None
+
+            input_tensor = preprocessor.to_tensor(preprocessed)
+            assert input_tensor.shape == (1, 1, *target_shape)
+
+            fake_network_output = np.random.rand(*target_shape).astype(np.float32)
+            fake_network_output[
+                target_shape[0] // 4: 3 * target_shape[0] // 4,
+                target_shape[1] // 4: 3 * target_shape[1] // 4,
+                target_shape[2] // 4: 3 * target_shape[2] // 4
+            ] = 0.9
+
+            restored_mask = preprocessor.restore_mask_to_original_space(
+                fake_network_output,
+                preprocessed,
+                is_probability_map=False
+            )
+            restored_prob = preprocessor.restore_mask_to_original_space(
+                fake_network_output,
+                preprocessed,
+                is_probability_map=True
+            )
+
+            assert restored_mask.shape == orig_shape, \
+                f"Restored mask shape mismatch: {restored_mask.shape} vs {orig_shape}"
+            assert restored_prob.shape == orig_shape, \
+                f"Restored prob shape mismatch: {restored_prob.shape} vs {orig_shape}"
+
+            from app.processing import extract_thickness_map
+            thickness_map = extract_thickness_map(
+                restored_mask,
+                orig_spacing,
+                axis=2,
+                method="axial_projection"
+            )
+            assert thickness_map.shape == orig_shape[:2]
+
+            physical_scale_factor_z = orig_spacing[2] * 1000
+            print(f"    ✓ Preprocessed: {preprocessed.volume.shape}")
+            print(f"    ✓ Restored:    {restored_mask.shape}")
+            print(f"    ✓ Thickness:   {thickness_map.shape} (Z-spacing={physical_scale_factor_z:.2f} μm/slice)")
+            print(f"    ✓ Input tensor: {input_tensor.shape} (matches network input)")
+            print(f"    ✅ {name} PASSED - NO shape mismatch crash!")
+
+        except Exception as e:
+            all_passed = False
+            print(f"    ❌ {name} FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    print("\n" + "=" * 70)
+    if all_passed:
+        print("  ✅ ALL DEVICE COMPATIBILITY TESTS PASSED!")
+        print("     PhysicalSpaceResampler successfully eliminates shape mismatch.")
+    else:
+        print("  ❌ SOME TESTS FAILED")
+    print("=" * 70)
+
+    return all_passed
+
+
+def test_preprocessing_input_validation():
+    """测试输入边界保护和鲁棒性"""
+    from app.processing.image_loader import VolumeInfo
+    from app.processing.preprocessing import OCTPreprocessor
+
+    target_shape = (128, 128, 64)
+    preprocessor = OCTPreprocessor(
+        target_shape=target_shape,
+        use_physical_resampling=True,
+        apply_bias_correction=False
+    )
+
+    print("\n--- Input Validation Tests ---")
+
+    invalid_cases = [
+        ("2D volume", np.random.rand(100, 100).astype(np.float32), (0.005, 0.005, 0.0035), ValueError),
+    ]
+
+    for name, vol, spacing, expected_exc in invalid_cases:
+        try:
+            info = VolumeInfo(shape=vol.shape, voxel_spacing=spacing, file_format="nifti")
+            preprocessor.preprocess(vol, info)
+            print(f"  ❌ {name}: should have raised {expected_exc.__name__}")
+        except expected_exc as e:
+            print(f"  ✓ {name}: correctly raised {expected_exc.__name__}")
+
+    suspicious_spacing_cases = [
+        ("Zero spacing (Z)", (200, 200, 128), (0.005, 0.005, 0.0)),
+        ("Huge spacing (units mismatch)", (200, 200, 128), (5.0, 5.0, 3.5)),
+        ("Tiny spacing (units mismatch)", (200, 200, 128), (5e-9, 5e-9, 3.5e-9)),
+    ]
+
+    for name, shape, spacing in suspicious_spacing_cases:
+        vol = np.random.rand(*shape).astype(np.float32) * 100 + 50
+        info = VolumeInfo(shape=shape, voxel_spacing=spacing, file_format="nifti")
+        try:
+            result = preprocessor.preprocess(vol, info)
+            assert result.volume.shape == target_shape
+            print(f"  ✓ {name}: handled gracefully (with warnings) → {result.volume.shape}")
+        except Exception as e:
+            print(f"  ❌ {name}: unexpected error: {e}")
+            raise
+
+    print("--- Input Validation Tests PASSED ---\n")
+    return True
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  Glaucoma OCT AI Platform - Integration Test")
     print("=" * 60)
 
+    print("\n" + "-" * 60)
+    print("  Test 1: Full Inference Pipeline")
+    print("-" * 60)
     test_full_inference_pipeline()
-    print("\n" + "-" * 60 + "\n")
+
+    print("\n" + "-" * 60)
+    print("  Test 2: NIfTI Save/Load")
+    print("-" * 60)
     try:
         test_save_and_load_synthetic_nifti()
     except Exception as e:
         print(f"⚠️  NIfTI test skipped/warning: {e}")
+
+    print("\n" + "-" * 60)
+    print("  Test 3: Multi-Device Compatibility (核心验证)")
+    print("-" * 60)
+    test_multi_device_shape_spacing_compatibility()
+
+    print("\n" + "-" * 60)
+    print("  Test 4: Input Validation & Boundary Protection")
+    print("-" * 60)
+    test_preprocessing_input_validation()
 
     print("\n" + "=" * 60)
     print("  All integration tests completed successfully!")

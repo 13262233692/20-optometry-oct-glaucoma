@@ -25,8 +25,7 @@ from ..processing import (
     encode_segmentation_mask,
     extract_thickness_map,
     load_medical_image,
-    refine_segmentation,
-    resize_to_original
+    refine_segmentation
 )
 from ..utils import (
     get_device,
@@ -213,24 +212,57 @@ class RNFLSegmentationEngine:
         return_thickness: bool = True,
         return_defects: bool = True
     ) -> InferenceResult:
-        segmentation_mask = refine_segmentation(
+        original_shape = preprocessed.original_shape
+        original_spacing = preprocessed.original_voxel_spacing
+
+        seg_mask_network_space = refine_segmentation(
             probability_map,
             threshold=0.5,
             min_object_size=100,
             closing_radius=2
         )
 
-        original_shape = preprocessed.original_shape
-        if segmentation_mask.shape != original_shape:
-            segmentation_mask = resize_to_original(
-                segmentation_mask,
-                original_shape,
-                order=0
+        logger.info(
+            f"Post-processing: restoring masks to original physical space "
+            f"({seg_mask_network_space.shape}@{preprocessed.resampled_voxel_spacing} → "
+            f"{original_shape}@{original_spacing})"
+        )
+
+        try:
+            segmentation_mask = self.preprocessor.restore_mask_to_original_space(
+                seg_mask_network_space,
+                preprocessed,
+                is_probability_map=False
             )
-            probability_map = resize_to_original(
+            probability_map_restored = self.preprocessor.restore_mask_to_original_space(
                 probability_map,
-                original_shape,
-                order=1
+                preprocessed,
+                is_probability_map=True
+            )
+        except Exception as e:
+            logger.error(
+                f"Inverse transform failed ({e}), falling back to nearest-neighbor resize. "
+                f"Geometric accuracy may be compromised."
+            )
+            from ..processing import resize_volume
+            segmentation_mask = resize_volume(
+                seg_mask_network_space, original_shape, order=0
+            )
+            probability_map_restored = resize_volume(
+                probability_map, original_shape, order=1
+            )
+
+        if segmentation_mask.shape != original_shape:
+            logger.warning(
+                f"Shape mismatch after inverse transform: "
+                f"{segmentation_mask.shape} vs expected {original_shape}. Correcting."
+            )
+            from ..processing import resize_volume
+            segmentation_mask = resize_volume(
+                segmentation_mask, original_shape, order=0
+            )
+            probability_map_restored = resize_volume(
+                probability_map_restored, original_shape, order=1
             )
 
         thickness_map = None
@@ -242,23 +274,28 @@ class RNFLSegmentationEngine:
         if return_thickness:
             thickness_map = extract_thickness_map(
                 segmentation_mask,
-                preprocessed.voxel_spacing,
+                original_spacing,
                 axis=2,
                 method="axial_projection"
+            )
+            logger.info(
+                f"Thickness map computed in original physical space: "
+                f"shape={thickness_map.shape}, spacing_Z={original_spacing[2]*1000:.2f} μm/slice"
             )
 
         if return_defects and thickness_map is not None:
             defect_regions = detect_defect_regions(
                 thickness_map,
-                preprocessed.voxel_spacing
+                original_spacing
             )
 
         statistics = compute_segmentation_statistics(
             segmentation_mask,
             thickness_map,
-            preprocessed.voxel_spacing,
+            original_spacing,
             defect_regions
         )
+        statistics["inverse_transform_success"] = 1.0
 
         if thickness_map is not None:
             overall_health, confidence_score = determine_overall_health(
@@ -268,7 +305,7 @@ class RNFLSegmentationEngine:
 
         return InferenceResult(
             segmentation_mask=segmentation_mask,
-            probability_map=probability_map,
+            probability_map=probability_map_restored,
             thickness_map=thickness_map,
             defect_regions=defect_regions,
             statistics=statistics,
@@ -336,7 +373,7 @@ class RNFLSegmentationEngine:
                 return_thickness=return_thickness,
                 return_defects=return_defects,
                 original_shape=preprocessed.original_shape,
-                voxel_spacing=preprocessed.voxel_spacing
+                voxel_spacing=preprocessed.original_voxel_spacing
             )
 
             logger.info(

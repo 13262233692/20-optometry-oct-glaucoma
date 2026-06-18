@@ -5,13 +5,20 @@ from .image_loader import (
     get_volume_info,
     ImageLoadingError
 )
+from .resampler import (
+    PhysicalSpaceResampler,
+    ResampleResult,
+    ResampleTransform,
+    get_physical_resampler
+)
 from .preprocessing import (
     OCTPreprocessor,
     PreprocessingResult,
     preprocess_oct_volume,
     resize_volume,
     normalize_volume,
-    denoise_volume
+    denoise_volume,
+    bias_correction
 )
 from .postprocessing import (
     extract_thickness_map,
@@ -31,12 +38,17 @@ __all__ = [
     "load_medical_image",
     "get_volume_info",
     "ImageLoadingError",
+    "PhysicalSpaceResampler",
+    "ResampleResult",
+    "ResampleTransform",
+    "get_physical_resampler",
     "OCTPreprocessor",
     "PreprocessingResult",
     "preprocess_oct_volume",
     "resize_volume",
     "normalize_volume",
     "denoise_volume",
+    "bias_correction",
     "extract_thickness_map",
     "detect_defect_regions",
     "determine_overall_health",
