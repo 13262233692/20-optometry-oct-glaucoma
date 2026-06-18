@@ -184,7 +184,7 @@ def test_full_inference_pipeline():
         timing=timing
     )
 
-    print("\n✅ Full inference pipeline completed successfully!")
+    print("\n[OK] Full inference pipeline completed successfully!")
     print(f"   Total time: {timing.total_ms:.1f} ms")
     print(f"   Health: {result.overall_health.value} ({result.confidence_score:.1%})")
 

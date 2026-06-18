@@ -155,6 +155,151 @@ def test_resnet3d_prediction():
     assert torch.all(prediction <= 1.0)
 
 
+def test_gradcam_import():
+    from app.xai import (
+        GradCAM3D,
+        GradCAMResult,
+        compute_gradcam3d,
+        get_gradcam_heatmap_data
+    )
+    assert GradCAM3D is not None
+    assert GradCAMResult is not None
+    assert compute_gradcam3d is not None
+    assert get_gradcam_heatmap_data is not None
+
+
+def test_gradcam3d_basic():
+    import torch
+    from app.models import create_resnet3d_model
+    from app.xai import GradCAM3D
+
+    model = create_resnet3d_model(
+        in_channels=1,
+        num_classes=2,
+        model_name="resnet3d_18"
+    )
+    model.eval()
+    device = torch.device("cpu")
+    model.to(device)
+
+    input_tensor = torch.randn(1, 1, 64, 64, 32).to(device)
+
+    cam = GradCAM3D(
+        model,
+        target_layer_names=[
+            "model.encoder.layer4",
+            "model.decoders.3",
+            "model.final_conv.3"
+        ],
+        device=device
+    )
+
+    try:
+        result = cam.generate(
+            input_tensor,
+            class_index=1,
+            target_shape=(64, 64, 32),
+            fusion="mean"
+        )
+
+        assert result.heatmap_3d.shape == (64, 64, 32)
+        assert result.heatmap_axial_max.shape == (64, 64)
+        assert result.heatmap_coronal_max.shape == (64, 32)
+        assert result.heatmap_sagittal_max.shape == (64, 32)
+
+        assert result.heatmap_3d.dtype == np.float32
+        assert np.min(result.heatmap_3d) >= 0.0 - 1e-6
+        assert np.max(result.heatmap_3d) <= 1.0 + 1e-6
+        assert result.class_index == 1
+        assert 0.0 <= result.class_score <= 1.0
+
+        assert "num_layers_fused" in result.metadata
+        assert result.metadata["num_layers_fused"] >= 1
+
+        non_zero = np.count_nonzero(result.heatmap_3d > 0.1)
+        print(f"  Grad-CAM heatmap: >0.1 voxels = {non_zero:,} / {result.heatmap_3d.size:,}")
+        assert non_zero > 0, "Grad-CAM should produce non-trivial activation"
+
+        print(f"  ✓ heatmap_3d shape: {result.heatmap_3d.shape}")
+        print(f"  ✓ axial projection: {result.heatmap_axial_max.shape}")
+        print(f"  ✓ layers used: {result.target_layer_name}")
+
+    finally:
+        cam._remove_hooks()
+
+
+def test_gradcam_compute_wrapper():
+    import torch
+    from app.models import create_resnet3d_model
+    from app.xai import compute_gradcam3d, get_gradcam_heatmap_data
+
+    model = create_resnet3d_model(in_channels=1, num_classes=2, model_name="resnet3d_18")
+    model.eval()
+
+    H, W, D = 64, 64, 32
+    input_tensor = torch.randn(1, 1, H, W, D)
+
+    result = compute_gradcam3d(
+        model,
+        input_tensor,
+        class_index=1,
+        target_shape=(H, W, D)
+    )
+
+    assert result.heatmap_3d.shape == (H, W, D)
+
+    heatmap_data = get_gradcam_heatmap_data(result)
+    assert len(heatmap_data.axial_projection) == H
+    assert len(heatmap_data.axial_projection[0]) == W
+    assert heatmap_data.class_index == 1
+    assert 0.0 <= heatmap_data.class_score <= 1.0
+    assert heatmap_data.target_layer is not None
+
+
+def test_gradcam_single_layer():
+    import torch
+    from app.models import create_resnet3d_model
+    from app.xai import GradCAM3D
+
+    model = create_resnet3d_model(in_channels=1, num_classes=2, model_name="resnet3d_18")
+    model.eval()
+
+    H, W, D = 64, 64, 32
+    input_tensor = torch.randn(1, 1, H, W, D)
+
+    cam = GradCAM3D(model, target_layer_names=["model.encoder.layer4"])
+    try:
+        result = cam.generate(input_tensor, class_index=1)
+        assert result.heatmap_3d.shape == (H, W, D)
+        assert result.metadata["num_layers_fused"] == 1
+    finally:
+        cam._remove_hooks()
+
+
+def test_gradcam_max_fusion():
+    import torch
+    from app.models import create_resnet3d_model
+    from app.xai import GradCAM3D
+
+    model = create_resnet3d_model(in_channels=1, num_classes=2, model_name="resnet3d_18")
+    model.eval()
+
+    H, W, D = 64, 64, 32
+    input_tensor = torch.randn(1, 1, H, W, D)
+
+    cam = GradCAM3D(
+        model,
+        target_layer_names=["model.encoder.layer4", "model.decoders.3"]
+    )
+    try:
+        result = cam.generate(input_tensor, class_index=1, fusion="max")
+        assert result.heatmap_3d.shape == (H, W, D)
+        assert result.metadata["fusion_method"] == "max"
+        assert np.max(result.heatmap_3d) > 0.0
+    finally:
+        cam._remove_hooks()
+
+
 def test_health_status_enum():
     from app.models import HealthStatus
 

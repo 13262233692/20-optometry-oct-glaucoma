@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     num_classes: int = Field(default=2, description="分割类别数 (背景+RNFL)")
     in_channels: int = Field(default=1, description="输入通道数")
 
+    enable_xai: bool = Field(default=True, description="是否启用 XAI 可解释性分析 (Grad-CAM 3D)")
+    xai_class_index: int = Field(default=1, description="XAI 归因类别 (1=RNFL, 0=背景)")
+    xai_target_layers: Optional[str] = Field(
+        default=None,
+        description="Grad-CAM 目标层逗号分隔列表，None=使用默认多层融合"
+    )
+
     rnfl_normal_thickness_min: float = Field(default=80.0, description="RNFL 正常厚度下限 (μm)")
     rnfl_normal_thickness_max: float = Field(default=120.0, description="RNFL 正常厚度上限 (μm)")
     rnfl_thickness_warning_threshold: float = Field(

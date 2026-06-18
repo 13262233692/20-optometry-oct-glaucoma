@@ -68,6 +68,25 @@ class RNFLSegmentationResult(BaseModel):
     rnfl_volume_mm3: float = Field(..., description="RNFL 体积 (mm³)")
 
 
+class GradCAMHeatmapResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    axial_projection: List[List[float]] = Field(
+        ..., description="轴位（Z轴）最大投影热力图 [0,1] 归一化"
+    )
+    coronal_projection: List[List[float]] = Field(
+        ..., description="冠状位（Y轴）最大投影热力图 [0,1] 归一化"
+    )
+    sagittal_projection: List[List[float]] = Field(
+        ..., description="矢状位（X轴）最大投影热力图 [0,1] 归一化"
+    )
+    target_layer: str = Field(..., description="Grad-CAM 目标卷积层名称")
+    class_index: int = Field(..., description="归因类别索引 (1=RNFL)")
+    class_score: float = Field(..., description="归因类别置信度 [0,1]")
+    mean_activation: float = Field(..., description="3D 热力图平均激活值")
+    max_activation: float = Field(..., description="3D 热力图最大激活值")
+
+
 class InferenceResponse(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
@@ -84,10 +103,14 @@ class InferenceResponse(BaseModel):
     inference_time_ms: float = Field(..., description="推理耗时 (毫秒)")
     preprocessing_time_ms: float = Field(..., description="预处理耗时 (毫秒)")
     postprocessing_time_ms: float = Field(..., description="后处理耗时 (毫秒)")
+    xai_time_ms: float = Field(default=0.0, description="XAI Grad-CAM 特征归因耗时 (毫秒)")
 
     segmentation: Optional[RNFLSegmentationResult] = Field(None, description="分割结果")
     thickness_map: Optional[ThicknessMapData] = Field(None, description="厚度分布拓扑图")
     defect_regions: Optional[List[DefectRegion]] = Field(None, description="高危缺损区域列表")
+    gradcam_heatmap: Optional[GradCAMHeatmapResponse] = Field(
+        None, description="Grad-CAM 3D 特征归因热力图（XAI 可解释性）"
+    )
 
     statistics: Dict[str, float] = Field(default_factory=dict, description="统计数据")
     model_info: Dict[str, str] = Field(default_factory=dict, description="模型信息")

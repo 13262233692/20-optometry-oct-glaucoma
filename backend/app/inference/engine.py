@@ -9,6 +9,7 @@ import torch
 
 from ..config import get_settings
 from ..models import (
+    GradCAMHeatmapResponse,
     HealthStatus,
     InferenceResponse,
     RNFLSegmentationResult,
@@ -41,6 +42,7 @@ logger = get_logger(__name__)
 class InferenceTiming:
     preprocessing_ms: float = 0.0
     inference_ms: float = 0.0
+    xai_ms: float = 0.0
     postprocessing_ms: float = 0.0
     total_ms: float = 0.0
 
@@ -51,9 +53,10 @@ class InferenceResult:
     probability_map: np.ndarray
     thickness_map: Optional[np.ndarray]
     defect_regions: Optional[list]
-    statistics: Dict[str, float]
-    overall_health: HealthStatus
-    confidence_score: float
+    gradcam_result: Optional[object] = None
+    statistics: Dict[str, float] = field(default_factory=dict)
+    overall_health: HealthStatus = HealthStatus.UNKNOWN
+    confidence_score: float = 0.0
     timing: InferenceTiming = field(default_factory=InferenceTiming)
 
 
@@ -152,6 +155,43 @@ class RNFLSegmentationEngine:
                     return torch.sigmoid(output)
         else:
             return self._raw_model.predict(input_tensor)
+
+    def _generate_gradcam(
+        self,
+        input_tensor: np.ndarray,
+        target_shape: Optional[Tuple[int, int, int]] = None
+    ) -> Optional[object]:
+        if not self.settings.enable_xai:
+            return None
+
+        try:
+            from ..xai import compute_gradcam3d, GradCAMResult
+
+            target_layers = None
+            if self.settings.xai_target_layers:
+                target_layers = [
+                    s.strip() for s in self.settings.xai_target_layers.split(",") if s.strip()
+                ]
+
+            tensor = torch.from_numpy(input_tensor).to(self.device)
+            if self.precision == "fp16" and self.device.type == "cuda":
+                tensor = tensor.half()
+            else:
+                tensor = tensor.float()
+
+            gradcam_result: GradCAMResult = compute_gradcam3d(
+                model=self._raw_model,
+                input_tensor=tensor,
+                class_index=self.settings.xai_class_index,
+                target_shape=target_shape,
+                target_layers=target_layers,
+                device=self.device
+            )
+            return gradcam_result
+
+        except Exception as e:
+            logger.warning(f"Grad-CAM generation failed: {e}. XAI heatmap will be omitted.")
+            return None
 
     def warmup(self, num_runs: int = 3) -> None:
         if not self.is_loaded:
@@ -348,6 +388,45 @@ class RNFLSegmentationEngine:
             probability_map = self._infer(input_tensor)
             timing.inference_ms = (time.perf_counter() - inference_start) * 1000
 
+            gradcam_result = None
+            if self.settings.enable_xai:
+                xai_start = time.perf_counter()
+                logger.info("Generating Grad-CAM 3D heatmap for XAI interpretability...")
+                gradcam_result = self._generate_gradcam(
+                    input_tensor,
+                    target_shape=preprocessed.target_shape
+                )
+                if gradcam_result is not None:
+                    try:
+                        logger.info(
+                            f"Restoring Grad-CAM heatmap to original physical space: "
+                            f"{gradcam_result.heatmap_3d.shape} -> {preprocessed.original_shape}"
+                        )
+                        restored_3d = self.preprocessor.restore_mask_to_original_space(
+                            gradcam_result.heatmap_3d,
+                            preprocessed,
+                            is_probability_map=True
+                        )
+                        gradcam_result.heatmap_3d = restored_3d.astype(np.float32)
+                        gradcam_result.heatmap_axial_max = np.max(restored_3d, axis=2)
+                        gradcam_result.heatmap_coronal_max = np.max(restored_3d, axis=1)
+                        gradcam_result.heatmap_sagittal_max = np.max(restored_3d, axis=0)
+                        gradcam_result.metadata["original_space_restored"] = True
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to restore Grad-CAM to original space ({e}), "
+                            f"using network-space heatmap"
+                        )
+                        gradcam_result.metadata["original_space_restored"] = False
+                timing.xai_ms = (time.perf_counter() - xai_start) * 1000
+                if gradcam_result is not None:
+                    logger.info(
+                        f"Grad-CAM generated: layers={gradcam_result.target_layer_name}, "
+                        f"class_idx={gradcam_result.class_index}, "
+                        f"score={gradcam_result.class_score:.3f}, "
+                        f"final_shape={gradcam_result.heatmap_3d.shape}"
+                    )
+
             postprocess_start = time.perf_counter()
             result = self._postprocess(
                 probability_map,
@@ -356,6 +435,7 @@ class RNFLSegmentationEngine:
                 return_thickness,
                 return_defects
             )
+            result.gradcam_result = gradcam_result
             timing.postprocessing_ms = (time.perf_counter() - postprocess_start) * 1000
 
             result.timing = timing
@@ -426,6 +506,26 @@ class RNFLSegmentationEngine:
         if return_defects and result.defect_regions is not None:
             defect_regions = result.defect_regions
 
+        gradcam_heatmap = None
+        if result.gradcam_result is not None:
+            try:
+                from ..xai import get_gradcam_heatmap_data
+
+                gradcam_data = get_gradcam_heatmap_data(result.gradcam_result, voxel_spacing)
+                gradcam_heatmap = GradCAMHeatmapResponse(
+                    axial_projection=gradcam_data.axial_projection,
+                    coronal_projection=gradcam_data.coronal_projection,
+                    sagittal_projection=gradcam_data.sagittal_projection,
+                    target_layer=gradcam_data.target_layer,
+                    class_index=gradcam_data.class_index,
+                    class_score=gradcam_data.class_score,
+                    mean_activation=gradcam_data.mean_activation,
+                    max_activation=gradcam_data.max_activation
+                )
+            except Exception as e:
+                logger.warning(f"Failed to serialize Grad-CAM response: {e}")
+                gradcam_heatmap = None
+
         model_info = {
             "name": self.model_name,
             "version": "1.0.0",
@@ -446,9 +546,11 @@ class RNFLSegmentationEngine:
             inference_time_ms=timing.inference_ms,
             preprocessing_time_ms=timing.preprocessing_ms,
             postprocessing_time_ms=timing.postprocessing_ms,
+            xai_time_ms=timing.xai_ms,
             segmentation=segmentation,
             thickness_map=thickness_map_data,
             defect_regions=defect_regions,
+            gradcam_heatmap=gradcam_heatmap,
             statistics=result.statistics,
             model_info=model_info
         )
